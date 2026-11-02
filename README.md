@@ -21,6 +21,8 @@ docs/                   design, architecture, workflow, runbook
 .github/                CI workflows (Phase 8)
 ```
 
+Design: [docs/design.md](docs/design.md).
+
 Fabric Git integration is disabled on our tenant, so notebooks are synced manually —
 see [docs/workflow.md](docs/workflow.md).
 
