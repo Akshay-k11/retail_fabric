@@ -1,6 +1,6 @@
 # Design – Retail Fabric Lakehouse
 
-Status: **Draft for review** · Phase 1 · Owner: Akshay
+Status: **Approved** · Phase 1 · Owner: Akshay
 
 ---
 
@@ -15,7 +15,7 @@ daily-refreshed sales model to answer:
 | Q2 | Which categories and products drive revenue and margin? | Net sales, gross margin % by category / product |
 | Q3 | How do channels compare (store vs online vs mobile)? | Net sales, average order value (AOV) by channel |
 | Q4 | How many customers buy, and which segments / loyalty tiers? | Active customers, sales by segment & tier |
-| Q5 | How much is cancelled or returned? | Cancelled %, returned % of net sales |
+| Q5 | How much is cancelled or returned? | Cancelled / returned order count and booked amount |
 
 **Freshness SLA:** data up to end of previous day (D-1) available by **07:00 UTC**.
 
@@ -107,7 +107,7 @@ The pipeline must treat these files exactly as if they came from an external sys
 | Unparseable `order_ts` | orders | Quarantine |
 | Guest orders (null customer_id) | orders | Load; map to Unknown customer in gold |
 | Quantity ≤ 0, negative price | order_items | Quarantine |
-| Orphan product_id (not in products) | order_items | Load; map to Unknown product in gold; report |
+| Orphan product_id (not in products) | order_items | **Quarantine**; retried automatically on later runs in case the product arrives late |
 | Late-arriving order header (items arrive a day before the order) | orders/items | Load items; fix gold automatically when the header arrives |
 | Messy text (case, spaces) | customers | Standardise in silver |
 | Malformed record (bad JSON / wrong column count) | all | Quarantine |
@@ -209,13 +209,20 @@ gold.agg_sales_daily  (date × category × channel)
 | quantity | units |
 | gross_amount | quantity × unit_price |
 | discount_amount | gross_amount × discount_pct |
-| net_amount | gross_amount − discount_amount |
-| cost_amount | quantity × product unit_cost |
-| margin_amount | net_amount − cost_amount |
+| booked_amount | gross_amount − discount_amount (value when ordered, always populated) |
 | is_cancelled, is_returned | flags from order_status |
+| is_revenue | `true` unless order_status is CANCELLED or RETURNED |
+| net_amount | booked_amount if is_revenue else 0 |
+| cost_amount | quantity × product unit_cost if is_revenue else 0 |
+| margin_amount | net_amount − cost_amount |
 | _gold_updated_ts | load timestamp |
 
-**gold.agg_sales_daily**: grain: date_key × category × channel; orders, units, net_amount, margin_amount.
+**Cancelled / returned orders** are kept in the fact (never physically deleted) but contribute **0** to
+net sales, cost and margin. Their value stays visible in `booked_amount` for the Q5 return/cancel KPIs.
+When an order changes status to RETURNED, the fact rows are updated by the normal incremental refresh.
+
+**gold.agg_sales_daily**: grain: date_key × category × channel; orders, units, net_amount, margin_amount
+(revenue orders only), plus cancelled_amount and returned_amount.
 Rebuilt only for the dates touched in each run.
 
 ### 6.2 Dimensions
@@ -253,6 +260,11 @@ Severity **error** → row quarantined (not loaded). **warn** → row loaded, fa
 | order_items | quantity_positive | quantity > 0 | error |
 | order_items | price_non_negative | unit_price ≥ 0 | error |
 | order_items | discount_range | discount_pct BETWEEN 0 AND 0.5 | warn |
+| order_items | product_exists | product_id exists in silver.products | error (**retryable**) |
+
+**Retryable quarantine:** rows that failed *only* `product_exists` are re-checked at the start of every
+silver run. If the product has since arrived they are loaded and marked `_resolved_ts` in the quarantine
+table. silver.products is therefore always processed **before** silver.order_items.
 
 **Pipeline-level checks** (`nb_05_validate`, fail the run on error):
 
@@ -262,8 +274,9 @@ Severity **error** → row quarantined (not loaded). **warn** → row loaded, fa
 | Exactly one `is_current` row per customer in dim_customer | error |
 | No null surrogate keys in fact_sales | error |
 | Row count: fact_sales = silver.order_items | error |
-| Sum: fact net_amount = silver line_amount (± 0.01) | error |
-| Unknown product/customer rate in fact (excl. guests) < 2% | warn |
+| Sum: fact booked_amount = silver line_amount (± 0.01) | error |
+| No `product_sk = -1` in fact_sales (orphans are quarantined) | error |
+| Unresolved orphan order lines older than 3 days | warn |
 | Quarantine rate per entity in today's run < 5% | warn |
 | Freshness: max order_date in fact ≥ run_date − 1 | error |
 
@@ -350,8 +363,9 @@ Config lives in `nb_config`. Environment is detected from the workspace name
 | D4 | Hash-based surrogate keys | Identity / sequence | Deterministic, re-runnable, no state |
 | D5 | Logic in library notebooks (`%run`) | Python wheel in Environment | Fast dev loop; migrate to wheel in Phase 8 |
 | D6 | Manual Git sync | Fabric Git integration | GitHub sync blocked by tenant policy |
+| D7 | Quarantine orphan order lines (retryable) | Load as Unknown product | Product-level reporting must be complete; late products self-heal |
+| D8 | Cancelled/returned → net 0, rows kept | Physically delete rows; negative amounts | Keeps audit trail and return-rate KPI; sales totals exclude them |
 
 ## 14. Open questions
 
-1. Is a 2% unknown-product threshold acceptable, or should orphan items be quarantined instead?
-2. Should returned orders reduce net sales (negative), or only be flagged? *Current design: flagged only.*
+None. Resolved: orphan lines → D7, returns → D8.
